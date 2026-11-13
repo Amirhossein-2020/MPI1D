@@ -120,7 +120,7 @@ int heat_eqn_solver_1d( double *heat_array, double *err, size_t num_pts ){
             exit( EXIT_FAILURE );
         }
 
-        int32_t size_send = 2 * ( HALO * sizeof(double) + MPI_BSEND_OVERHEAD );
+        int32_t size_send = 8 * ( HALO * sizeof(double) + MPI_BSEND_OVERHEAD );
         init = posix_memalign( ( void** )&buff_send, CACHE_LINE_SIZE, ( size_send + CACHE_LINE_SIZE - 1 ) & ~( CACHE_LINE_SIZE - 1 ) );
         if ( init != 0 ) {
             fprintf( stderr, "Error: posix_memalign for buff_send failed with code %s. Rank %d\n", strerror( init ), rank_mpi );
