@@ -10,7 +10,7 @@
 #include <math.h>
 #define MAX( a , b ) ( (a) > (b) ? (a) : (b) )
 #define MIN( a , b ) ( (a) < (b) ? (a) : (b) )
-#define HALO 32
+#define HALO 64
 
 #if defined(__AVX512F__)
     #define ELEM_D 8
@@ -74,7 +74,8 @@
 
 int heat_eqn_solver_1d( double *heat_array, double *err, size_t num_pts ){
     int32_t size_mpi, rank_mpi;
-    double *chunk, *chunk_cp;
+    double *chunk, *buff_send;
+    MPI_Request req[ 2 ];
     MPI_Comm_size( MPI_COMM_WORLD, &size_mpi );
     MPI_Comm_rank( MPI_COMM_WORLD, &rank_mpi );
     int32_t min_chunk = num_pts + 1 > HALO * size_mpi ? size_mpi : MAX( 1, num_pts / HALO );
@@ -88,7 +89,6 @@ int heat_eqn_solver_1d( double *heat_array, double *err, size_t num_pts ){
     }
 
     if ( check_entrance ) {
-        MPI_Request req[ 4 ];
         int32_t check_left  = rank_mpi > 0 ? rank_mpi - 1 : MPI_PROC_NULL;
         int32_t check_right = rank_mpi < size_mpi - 1 ? rank_mpi + 1 : MPI_PROC_NULL;
         int32_t check_left_tag = check_left > - 1 ? check_left : MPI_ANY_TAG;
@@ -113,154 +113,371 @@ int heat_eqn_solver_1d( double *heat_array, double *err, size_t num_pts ){
         }
 
         double dx = 1.0 / ( num_pts + 1 );
-        int32_t init = posix_memalign( ( void** )&chunk, CACHE_LINE_SIZE, ( sizeof( double ) * ( size_check ) + CACHE_LINE_SIZE - 1 ) & ~( CACHE_LINE_SIZE - 1 ) );
+        int32_t init = posix_memalign( ( void** )&chunk, CACHE_LINE_SIZE, ( sizeof( double ) * ( size_check + ELEM_D ) + CACHE_LINE_SIZE - 1 ) & ~( CACHE_LINE_SIZE - 1 ) );
         if ( init != 0 ) {
             fprintf( stderr, "Error: posix_memalign for chunk failed with code %s. Rank %d\n", strerror( init ), rank_mpi );
             MPI_Abort( MPI_COMM_WORLD, EXIT_FAILURE );
             exit( EXIT_FAILURE );
         }
 
-        init = posix_memalign( ( void** )&chunk_cp, CACHE_LINE_SIZE, ( sizeof( double ) * ( size_check ) + CACHE_LINE_SIZE - 1 ) & ~( CACHE_LINE_SIZE - 1 ) );
+        int32_t size_send = 2 * ( HALO * sizeof(double) + MPI_BSEND_OVERHEAD );
+        init = posix_memalign( ( void** )&buff_send, CACHE_LINE_SIZE, ( size_send + CACHE_LINE_SIZE - 1 ) & ~( CACHE_LINE_SIZE - 1 ) );
         if ( init != 0 ) {
-            fprintf( stderr, "Error: posix_memalign for chunk_cp failed with code %s. Rank %d\n", strerror( init ), rank_mpi );
+            fprintf( stderr, "Error: posix_memalign for buff_send failed with code %s. Rank %d\n", strerror( init ), rank_mpi );
             MPI_Abort( MPI_COMM_WORLD, EXIT_FAILURE );
             exit( EXIT_FAILURE );
         }
 
+        MPI_Buffer_attach( buff_send, size_send );
+
         memcpy( ( void* ) chunk, ( void* ) &heat_array[ cpy_check ], sizeof( double ) * ( size_check ) );
-        chunk_cp[ 0 ] = 0;
-        chunk_cp[ size_check - 1 ] = 0;
 
-        int32_t idx_halo_start = 1;
-        int32_t idx_halo_end = size_check - 2;
+        register int32_t idx_halo_start = 1;
+        register int32_t idx_halo_end = size_check - 2;
         TYPE_VEC_D err_vec = SET1_D( 0.0 );
-        double err_var = 0;
-        int32_t i;
+        TYPE_VEC_D new;
+        TYPE_VEC_D fut_vec1;
+        TYPE_VEC_D fut_vec2;
+        TYPE_VEC_D fut_vec3;
+        TYPE_VEC_D now_vec;
+        register double err_var = 0;
+        register double fut1;
+        register double fut2;
+        register double fut3;
+        register int32_t i;
+        register int32_t j;
         for ( i = 0; i < ITER - HALO; i += HALO ) {
-            int32_t j;
-            for ( j = local_start + 1; j < local_end + 1 - ELEM_D; j += ELEM_D ){
-                STOREU_D( &chunk_cp[ j ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ j - 1 ] ), LOADU_D( &chunk[ j + 1 ] ) ) ) );
+            double dex[ ] = { chunk[ local_end - 1 ], 0 };
+            double six[ ] = { chunk[ local_start + 1 ], 0 };
+            fut_vec1 = LOADU_D( &chunk[ local_start ] );
+            fut1 = chunk[ ( ( local_end - local_start - 1 ) & ~( ELEM_D * 2 - 1 ) ) + local_start ];
+            for ( j = local_start + 1; j < local_end + 1 - ELEM_D * 2; j += ELEM_D  * 2 ) {
+                fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                now_vec = LOADU_D( &chunk[ j ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                STOREU_D( &chunk[ j ], new );
+                err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
+                fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                now_vec = LOADU_D( &chunk[ j + ELEM_D ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                STOREU_D( &chunk[ j + ELEM_D ], new );
+                err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
             }
-            for ( ; j < local_end; j++ ) {
-                chunk_cp[ j ] = 0.5 * ( chunk[ j - 1 ] + chunk[ j + 1 ] );
+            for ( ; j < local_end - 1; j += 2 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                err_var += fabs( fut2 - chunk[ j ] );
+                fut1 = chunk[ j + 1 ];
+                chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+                err_var += fabs( fut1 - chunk[ j + 1 ] );
+            }
+            if ( j < local_end ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                err_var += fabs( fut2 - chunk[ j ] );
             }
 
-            if ( i > 0 ) MPI_Waitall( 4, req, MPI_STATUSES_IGNORE );
+            if ( i > 0 ) MPI_Waitall( 2, req, MPI_STATUSES_IGNORE );
 
-            for ( j = idx_halo_start; j < local_start + 2 - ELEM_D; j += ELEM_D ){
-                STOREU_D( &chunk_cp[ j ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ j - 1 ] ), LOADU_D( &chunk[ j + 1 ] ) ) ) );
+            double kol_mom = chunk[ local_start ];
+            six[ 1 ] = chunk[ local_start + 1 ];
+            chunk[ local_start + 1 ] = six[ 0 ];
+            dex[ 1 ] = chunk[ local_end - 1 ];
+            chunk[ local_end - 1 ] = dex[ 0 ];
+            fut_vec1 = LOADU_D( &chunk[ idx_halo_start - 1 ] );
+            fut1 = chunk[ ( ( local_start - idx_halo_start + 1 ) & ~( ELEM_D * 2 - 1 ) ) + idx_halo_start - 1 ];
+            for ( j = idx_halo_start; j < local_start + 2 - ELEM_D * 2; j += ELEM_D * 2 ){
+                fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                STOREU_D( &chunk[ j ], new );
+                fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                STOREU_D( &chunk[ j + ELEM_D ], new );
             }
-            for ( ; j < local_start + 1; j++ ) {
-                chunk_cp[ j ] = 0.5 * ( chunk[ j - 1 ] + chunk[ j + 1 ] );
+            for ( ; j < local_start; j += 2 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                fut1 = chunk[ j + 1 ];
+                chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
             }
+            if ( j < local_start + 1 ) {
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            }
+            err_var += fabs( kol_mom - chunk[ local_start ] );
 
-            for ( j = local_end; j < idx_halo_end + 2 - ELEM_D; j += ELEM_D ){
-                STOREU_D( &chunk_cp[ j ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ j - 1 ] ), LOADU_D( &chunk[ j + 1 ] ) ) ) );
+            kol_mom = chunk[ local_end ];
+            fut_vec1 = LOADU_D( &chunk[ local_end - 1 ] );
+            fut1 = chunk[ ( ( idx_halo_end - local_end + 1 ) & ~( ELEM_D * 2 - 1 ) ) + local_end - 1 ];
+            for ( j = local_end; j < idx_halo_end + 2 - ELEM_D * 2; j += ELEM_D * 2 ){
+                fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                STOREU_D( &chunk[ j ], new );
+                fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                STOREU_D( &chunk[ j + ELEM_D ], new );
             }
-            for ( ; j < idx_halo_end + 1; j++ ) {
-                chunk_cp[ j ] = 0.5 * ( chunk[ j - 1 ] + chunk[ j + 1 ] );
+            for ( ; j < idx_halo_end; j += 2 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                fut1 = chunk[ j + 1 ];
+                chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
             }
+            if ( j < idx_halo_end + 1 ) {
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            }
+            err_var += fabs( kol_mom - chunk[ local_end ] );
+            chunk[ local_end - 1 ] = dex[ 1 ];
+            chunk[ local_start + 1 ] = six[ 1 ];
 
-            for ( j = local_start; j < local_end + 2 - ELEM_D; j += ELEM_D ) {
-                err_vec = ADD_D( err_vec, ABS_D( SUB_D( LOADU_D( &chunk[ j ] ), LOADU_D( &chunk_cp[ j ] ) ) ) );
-            }
-            for ( ; j < local_end + 1; j++ ){
-                err_var += fabs( chunk[ j ] - chunk_cp[ j ] );
-            }
-
-            void *mom_ptr = ( void* )chunk;
-            chunk = chunk_cp;
-            chunk_cp = ( double* )mom_ptr;
             idx_halo_start = rank_mpi > 0 ? idx_halo_start + 1 : 1;
             idx_halo_end = rank_mpi < size_mpi - 1 ? idx_halo_end - 1 : size_check - 2;
 
             for ( int32_t z = 0; z < HALO - 1; z++ ) {
-                int32_t u;
-                for ( u = idx_halo_start; u < idx_halo_end + 2 - ELEM_D; u += ELEM_D ){
-                    STOREU_D( &chunk_cp[ u ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ u - 1 ] ), LOADU_D( &chunk[ u + 1 ] ) ) ) );
+                fut_vec1 = LOADU_D( &chunk[ idx_halo_start - 1 ] );
+                fut1 = chunk[ ( ( local_start - idx_halo_start ) & ~( ELEM_D * 2 - 1 ) ) + idx_halo_start - 1 ];
+                fut_vec3 = LOADU_D( &chunk[ local_start - 1 ] );
+                for ( j = idx_halo_start; j < local_start + 1 - ELEM_D * 2; j += ELEM_D * 2 ){
+                    fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                    new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                    STOREU_D( &chunk[ j ], new );
+                    fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                    new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                    STOREU_D( &chunk[ j + ELEM_D ], new );
                 }
-                for ( ; u < idx_halo_end + 1; u++ ) {
-                    chunk_cp[ u ] = 0.5 * ( chunk[ u - 1 ] + chunk[ u + 1 ] );
+                for ( ; j < local_start - 1; j += 2 ) {
+                    fut2 = chunk[ j ];
+                    chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                    fut1 = chunk[ j + 1 ];
+                    chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
                 }
-                for ( u = local_start; u < local_end + 2 - ELEM_D; u += ELEM_D ) {
-                    err_vec = ADD_D( err_vec, ABS_D( SUB_D( LOADU_D( &chunk[ u ] ), LOADU_D( &chunk_cp[ u ] ) ) ) );
+                if ( j < local_start ) {
+                    chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
                 }
-                for ( ; u < local_end + 1; u++ ){
-                    err_var += fabs( chunk[ u ] - chunk_cp[ u ] );
+
+                fut_vec1 = fut_vec3;
+                fut1 = chunk[ ( ( local_end - local_start + 1 ) & ~( ELEM_D * 2 - 1 ) ) + local_start - 1 ];
+                fut3 = chunk[ ( ( idx_halo_end - local_end ) & ~( ELEM_D * 2 - 1 ) ) + local_end ];
+                fut_vec3 = LOADU_D( &chunk[ local_end ] );
+                for ( j = local_start; j < local_end + 2 - ELEM_D * 2; j += ELEM_D  * 2 ) {
+                    fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                    now_vec = LOADU_D( &chunk[ j ] );
+                    new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                    STOREU_D( &chunk[ j ], new );
+                    err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
+                    fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                    now_vec = LOADU_D( &chunk[ j + ELEM_D ] );
+                    new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                    STOREU_D( &chunk[ j + ELEM_D ], new );
+                    err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
                 }
-                void *mom_ptr = ( void* )chunk;
-                chunk = chunk_cp;
-                chunk_cp = ( double* )mom_ptr;
+                for ( ; j < local_end; j += 2 ) {
+                    fut2 = chunk[ j ];
+                    chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                    err_var += fabs( fut2 - chunk[ j ] );
+                    fut1 = chunk[ j + 1 ];
+                    chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+                    err_var += fabs( fut1 - chunk[ j + 1 ] );
+                }
+                if ( j < local_end + 1 ) {
+                    fut2 = chunk[ j ];
+                    chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                    err_var += fabs( fut2 - chunk[ j ] );
+                }
+
+
+                fut_vec1 = fut_vec3;
+                fut1 = fut3;
+                for ( j = local_end + 1; j < idx_halo_end + 2 - ELEM_D * 2; j += ELEM_D * 2 ){
+                    fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                    new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                    STOREU_D( &chunk[ j ], new );
+                    fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                    new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                    STOREU_D( &chunk[ j + ELEM_D ], new );
+                }
+                for ( ; j < idx_halo_end; j += 2 ) {
+                    fut2 = chunk[ j ];
+                    chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                    fut1 = chunk[ j + 1 ];
+                    chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+                }
+                if ( j < idx_halo_end + 1 ) {
+                    chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                }
+
                 idx_halo_start = rank_mpi > 0 ? idx_halo_start + 1 : 1;
                 idx_halo_end = rank_mpi < size_mpi - 1 ? idx_halo_end - 1 : size_check - 2;
             }
 
-            MPI_Isend( &chunk[ local_start ], HALO, MPI_DOUBLE, check_left, rank_mpi, work_channel, &req[ 0 ] );
-            MPI_Isend( &chunk[ local_end - HALO + 1 ], HALO, MPI_DOUBLE, check_right, rank_mpi, work_channel, &req[ 1 ] );
-            MPI_Irecv( &chunk[ 0 ], HALO, MPI_DOUBLE, check_left, check_left_tag, work_channel, &req[ 2 ] );
-            MPI_Irecv( &chunk[ local_end + 1 ], HALO, MPI_DOUBLE, check_right, check_right_tag, work_channel, &req[ 3 ] );
+            MPI_Bsend( &chunk[ local_start ], HALO, MPI_DOUBLE, check_left, rank_mpi, work_channel );
+            MPI_Bsend( &chunk[ local_end - HALO + 1 ], HALO, MPI_DOUBLE, check_right, rank_mpi, work_channel );
+            MPI_Irecv( &chunk[ 0 ], HALO, MPI_DOUBLE, check_left, check_left_tag, work_channel, &req[ 0 ] );
+            MPI_Irecv( &chunk[ local_end + 1 ], HALO, MPI_DOUBLE, check_right, check_right_tag, work_channel, &req[ 1 ] );
 
             idx_halo_start = 1;
             idx_halo_end = size_check - 2;
         }
 
+
+        double dex[ ] = { chunk[ local_end - 1 ], 0 };
+        double six[ ] = { chunk[ local_start + 1 ], 0 };
         idx_halo_start = rank_mpi > 0 ? local_start - ( ITER - i ) + 1 : 1;
         idx_halo_end = rank_mpi < size_mpi - 1 ? local_end + ( ITER - i ) - 1 : size_check - 2;
-        int32_t j;
-        for ( j = local_start + 1; j < local_end + 1 - ELEM_D; j += ELEM_D ){
-            STOREU_D( &chunk_cp[ j ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ j - 1 ] ), LOADU_D( &chunk[ j + 1 ] ) ) ) );
+        fut_vec1 = LOADU_D( &chunk[ local_start ] );
+        fut1 = chunk[ ( ( local_end - local_start - 1 ) & ~( ELEM_D * 2 - 1 ) ) + local_start ];
+        for ( j = local_start + 1; j < local_end + 1 - ELEM_D * 2; j += ELEM_D  * 2 ) {
+            fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+            now_vec = LOADU_D( &chunk[ j ] );
+            new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+            STOREU_D( &chunk[ j ], new );
+            err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
+            fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+            now_vec = LOADU_D( &chunk[ j + ELEM_D ] );
+            new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+            STOREU_D( &chunk[ j + ELEM_D ], new );
+            err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
         }
-        for ( ; j < local_end; j++ ) {
-            chunk_cp[ j ] = 0.5 * ( chunk[ j - 1 ] + chunk[ j + 1 ] );
+        for ( ; j < local_end - 1; j += 2 ) {
+            fut2 = chunk[ j ];
+            chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            err_var += fabs( fut2 - chunk[ j ] );
+            fut1 = chunk[ j + 1 ];
+            chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+            err_var += fabs( fut1 - chunk[ j + 1 ] );
         }
-
-        if ( i > 0 ) MPI_Waitall( 4, req, MPI_STATUSES_IGNORE );
-
-        for ( j = idx_halo_start; j < local_start + 2 - ELEM_D; j += ELEM_D ){
-            STOREU_D( &chunk_cp[ j ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ j - 1 ] ), LOADU_D( &chunk[ j + 1 ] ) ) ) );
-        }
-        for ( ; j < local_start + 1; j++ ) {
-            chunk_cp[ j ] = 0.5 * ( chunk[ j - 1 ] + chunk[ j + 1 ] );
-        }
-
-        for ( j = local_end; j < idx_halo_end + 2 - ELEM_D; j += ELEM_D ){
-            STOREU_D( &chunk_cp[ j ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ j - 1 ] ), LOADU_D( &chunk[ j + 1 ] ) ) ) );
-        }
-        for ( ; j < idx_halo_end + 1; j++ ) {
-            chunk_cp[ j ] = 0.5 * ( chunk[ j - 1 ] + chunk[ j + 1 ] );
-        }
-
-        for ( j = local_start; j < local_end + 2 - ELEM_D; j += ELEM_D ) {
-            err_vec = ADD_D( err_vec, ABS_D( SUB_D( LOADU_D( &chunk[ j ] ), LOADU_D( &chunk_cp[ j ] ) ) ) );
-        }
-        for ( ; j < local_end + 1; j++ ){
-            err_var += fabs( chunk[ j ] - chunk_cp[ j ] );
+        if ( j < local_end ) {
+            fut2 = chunk[ j ];
+            chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            err_var += fabs( fut2 - chunk[ j ] );
         }
 
-        void *mom_ptr = ( void* )chunk;
-        chunk = chunk_cp;
-        chunk_cp = ( double* )mom_ptr;
+        if ( i > 0 ) MPI_Waitall( 2, req, MPI_STATUSES_IGNORE );
+
+        six[ 1 ] = chunk[ local_start + 1 ];
+        chunk[ local_start + 1 ] = six[ 0 ];
+        dex[ 1 ] = chunk[ local_end - 1 ];
+        chunk[ local_end - 1 ] = dex[ 0 ];
+        double kol_mom = chunk[ local_start ];
+        fut_vec1 = LOADU_D( &chunk[ idx_halo_start - 1 ] );
+        fut1 = chunk[ ( ( local_start - idx_halo_start + 1 ) & ~( ELEM_D * 2 - 1 ) ) + idx_halo_start - 1 ];
+        for ( j = idx_halo_start; j < local_start + 2 - ELEM_D * 2; j += ELEM_D * 2 ){
+            fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+            new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+            STOREU_D( &chunk[ j ], new );
+            fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+            new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+            STOREU_D( &chunk[ j + ELEM_D ], new );
+        }
+        for ( ; j < local_start; j += 2 ) {
+            fut2 = chunk[ j ];
+            chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            fut1 = chunk[ j + 1 ];
+            chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+        }
+        if ( j < local_start + 1 ) {
+            chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+        }
+        err_var += fabs( kol_mom - chunk[ local_start ] );
+
+        kol_mom = chunk[ local_end ];
+        fut_vec1 = LOADU_D( &chunk[ local_end - 1 ] );
+        fut1 = chunk[ ( ( idx_halo_end - local_end + 1 ) & ~( ELEM_D * 2 - 1 ) ) + local_end - 1 ];
+        for ( j = local_end; j < idx_halo_end + 2 - ELEM_D * 2; j += ELEM_D * 2 ){
+            fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+            new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+            STOREU_D( &chunk[ j ], new );
+            fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+            new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+            STOREU_D( &chunk[ j + ELEM_D ], new );
+        }
+        for ( ; j < idx_halo_end; j += 2 ) {
+            fut2 = chunk[ j ];
+            chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            fut1 = chunk[ j + 1 ];
+            chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+        }
+        if ( j < idx_halo_end + 1 ) {
+            chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+        }
+        err_var += fabs( kol_mom - chunk[ local_end ] );
+        chunk[ local_end - 1 ] = dex[ 1 ];
+        chunk[ local_start + 1 ] = six[ 1 ];
+
         idx_halo_start = rank_mpi > 0 ? idx_halo_start + 1 : 1;
         idx_halo_end = rank_mpi < size_mpi - 1 ? idx_halo_end - 1 : size_check - 2;
 
-        int32_t end = ITER - i - 1;
-        for ( int32_t z = 0; z < end; z++ ) {
-            int32_t u;
-            for ( u = idx_halo_start; u < idx_halo_end + 2 - ELEM_D; u += ELEM_D ){
-                STOREU_D( &chunk_cp[ u ], MUL_D( SET1_D( 0.5 ), ADD_D( LOADU_D( &chunk[ u - 1 ] ), LOADU_D( &chunk[ u + 1 ] ) ) ) );
+        for ( int32_t z = 0; z < ITER - i - 1; z++ ) {
+            fut_vec1 = LOADU_D( &chunk[ idx_halo_start - 1 ] );
+            fut1 = chunk[ ( ( local_start - idx_halo_start ) & ~( ELEM_D * 2 - 1 ) ) + idx_halo_start - 1 ];
+            fut_vec3 = LOADU_D( &chunk[ local_start - 1 ] );
+            for ( j = idx_halo_start; j < local_start + 1 - ELEM_D * 2; j += ELEM_D * 2 ){
+                fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                STOREU_D( &chunk[ j ], new );
+                fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                STOREU_D( &chunk[ j + ELEM_D ], new );
             }
-            for ( ; u < idx_halo_end + 1; u++ ) {
-                chunk_cp[ u ] = 0.5 * ( chunk[ u - 1 ] + chunk[ u + 1 ] );
+            for ( ; j < local_start - 1; j += 2 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                fut1 = chunk[ j + 1 ];
+                chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
             }
-            for ( u = local_start; u < local_end + 2 - ELEM_D; u += ELEM_D ) {
-                err_vec = ADD_D( err_vec, ABS_D( SUB_D( LOADU_D( &chunk[ u ] ), LOADU_D( &chunk_cp[ u ] ) ) ) );
+            if ( j < local_start ) {
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
             }
-            for ( ; u < local_end + 1; u++ ){
-                err_var += fabs( chunk[ u ] - chunk_cp[ u ] );
+
+            fut_vec1 = fut_vec3;
+            fut1 = chunk[ ( ( local_end - local_start + 1 ) & ~( ELEM_D * 2 - 1 ) ) + local_start - 1 ];
+            fut3 = chunk[ ( ( idx_halo_end - local_end ) & ~( ELEM_D * 2 - 1 ) ) + local_end ];
+            fut_vec3 = LOADU_D( &chunk[ local_end ] );
+            for ( j = local_start; j < local_end + 2 - ELEM_D * 2; j += ELEM_D  * 2 ) {
+                fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                now_vec = LOADU_D( &chunk[ j ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                STOREU_D( &chunk[ j ], new );
+                err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
+                fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                now_vec = LOADU_D( &chunk[ j + ELEM_D ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                STOREU_D( &chunk[ j + ELEM_D ], new );
+                err_vec = ADD_D( err_vec, ABS_D( SUB_D( now_vec, new ) ) );
             }
-            void *mom_ptr = ( void* )chunk;
-            chunk = chunk_cp;
-            chunk_cp = ( double* )mom_ptr;
+            for ( ; j < local_end; j += 2 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                err_var += fabs( fut2 - chunk[ j ] );
+                fut1 = chunk[ j + 1 ];
+                chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+                err_var += fabs( fut1 - chunk[ j + 1 ] );
+            }
+            if ( j < local_end + 1 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                err_var += fabs( fut2 - chunk[ j ] );
+            }
+
+
+            fut_vec1 = fut_vec3;
+            fut1 = fut3;
+            for ( j = local_end + 1; j < idx_halo_end + 2 - ELEM_D * 2; j += ELEM_D * 2 ){
+                fut_vec2 = LOADU_D( &chunk[ j - 1 + ELEM_D ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec1, LOADU_D( &chunk[ j + 1 ] ) ) );
+                STOREU_D( &chunk[ j ], new );
+                fut_vec1 = LOADU_D( &chunk[ j - 1 + ELEM_D * 2 ] );
+                new = MUL_D( SET1_D( 0.5 ), ADD_D( fut_vec2, LOADU_D( &chunk[ j + 1 + ELEM_D ] ) ) );
+                STOREU_D( &chunk[ j + ELEM_D ], new );
+            }
+            for ( ; j < idx_halo_end; j += 2 ) {
+                fut2 = chunk[ j ];
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+                fut1 = chunk[ j + 1 ];
+                chunk[ j + 1 ] = 0.5 * ( fut2 + chunk[ j + 2 ] );
+            }
+            if ( j < idx_halo_end + 1 ) {
+                chunk[ j ] = 0.5 * ( fut1 + chunk[ j + 1 ] );
+            }
             idx_halo_start = rank_mpi > 0 ? idx_halo_start + 1 : 1;
             idx_halo_end = rank_mpi < size_mpi - 1 ? idx_halo_end - 1 : size_check - 2;
         }
@@ -270,13 +487,15 @@ int heat_eqn_solver_1d( double *heat_array, double *err, size_t num_pts ){
         for ( j = 0; j < ELEM_D; j++ ) {
             err_var += buff[ j ];
         }
-        if ( rank_mpi == 0 ) MPI_Reduce( MPI_IN_PLACE, &err_var, 1, MPI_DOUBLE, MPI_SUM, 0, work_channel );
-        else MPI_Reduce( &err_var, NULL, 1, MPI_DOUBLE, MPI_SUM, 0, work_channel );
+        double err_var1 = err_var;
+        if ( rank_mpi == 0 ) MPI_Reduce( MPI_IN_PLACE, &err_var1, 1, MPI_DOUBLE, MPI_SUM, 0, work_channel );
+        else MPI_Reduce( &err_var1, NULL, 1, MPI_DOUBLE, MPI_SUM, 0, work_channel );
         MPI_Gatherv( ( void* ) &chunk[ local_start ], size, MPI_DOUBLE, ( void* ) heat_array, recvcounts, displs, MPI_DOUBLE, 0, work_channel );
 
-        *err = dx * err_var;
+        *err = dx * err_var1;
         free( chunk );
-        free( chunk_cp );
+        MPI_Buffer_detach( &buff_send, &size_send );
+        free( buff_send );
     }
     if ( check ) MPI_Comm_free( &work_channel );
     return 0;
