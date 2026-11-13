@@ -85,6 +85,26 @@ int main(int argc, char ** argv)
   int rank, size;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+  // Pre-warm MPI's lazily established channels before doing any real work.
+  // MPI_Init does not open every connection eagerly, so the first exchange
+  // (and collectives) can otherwise pay a one-off setup cost that would leak
+  // into measurements.
+  {
+    int warm_ret;
+    if (size > 1) {
+      double token = 1.0;
+      MPI_Status status;
+      int left  = (rank + size - 1) % size;
+      int right = (rank + 1) % size;
+      warm_ret = MPI_Sendrecv(&token, 1, MPI_DOUBLE, right, 4242,
+                              &token, 1, MPI_DOUBLE, left,  4242,
+                              MPI_COMM_WORLD, &status);
+      if (MPI_SUCCESS != warm_ret) MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    warm_ret = MPI_Barrier(MPI_COMM_WORLD);
+    if (MPI_SUCCESS != warm_ret) MPI_Abort(MPI_COMM_WORLD, 1);
+  }
   #endif
 
   
@@ -105,6 +125,11 @@ int main(int argc, char ** argv)
   ret = parse_input(argv[2], x_pos, heat_array, num_pts);
   if (ret != 0) {line = __LINE__; goto err_hndl;}
 
+
+  // Make sure every rank reaches the timed region together.
+  #ifdef USE_MPI
+  if (MPI_SUCCESS != MPI_Barrier(MPI_COMM_WORLD)) {line = __LINE__; goto err_hndl;}
+  #endif
 
   // Solve the heat equation
   __TIME_START__;
